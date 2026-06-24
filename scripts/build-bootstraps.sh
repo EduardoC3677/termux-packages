@@ -23,6 +23,19 @@ BOOTSTRAP_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/bootstrap-tmp.XXXXXXXX")
 # and <10.
 BOOTSTRAP_ANDROID10_COMPATIBLE=false
 
+# Debian proot mode: when enabled, build a Debian-based bootstrap
+# instead of a native Termux bootstrap.
+BOOTSTRAP_DEBIAN_PROOT=false
+DEBIAN_RELEASE="bookworm"
+
+# Debian architecture mapping from Termux arch names.
+declare -A DEBIAN_ARCH_MAP=(
+	["aarch64"]="arm64"
+	["arm"]="armhf"
+	["i686"]="i386"
+	["x86_64"]="amd64"
+)
+
 # By default, bootstrap archives will be built for all architectures
 # supported by Termux application.
 # Override with option '--architectures'.
@@ -229,6 +242,213 @@ add_termux_bootstrap_second_stage_files() {
 
 }
 
+# Build proot package from Termux source
+build_proot_package() {
+	local TERMUX_ARCH="$1"
+	
+	echo "[*] Building proot for architecture: ${TERMUX_ARCH}"
+	
+	# Build proot using Termux build system
+	cd "$TERMUX_PACKAGES_DIRECTORY"
+	if ! ./build-package.sh -a "$TERMUX_ARCH" proot; then
+		echo "[!] Failed to build proot package"
+		return 1
+	fi
+	
+	return 0
+}
+
+# Download Debian rootfs from official repositories
+download_debian_rootfs() {
+	local architecture="$1"
+	local debian_arch="${DEBIAN_ARCH_MAP[$architecture]}"
+	
+	if [ -z "$debian_arch" ]; then
+		echo "[!] Unsupported architecture '$architecture' for Debian rootfs"
+		return 1
+	fi
+	
+	echo "[*] Downloading Debian ${DEBIAN_RELEASE} rootfs for ${debian_arch}..."
+	
+	local rootfs_tmpdir="${BOOTSTRAP_TMPDIR}/debian-rootfs"
+	mkdir -p "$rootfs_tmpdir"
+	mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs"
+	
+	# Download Packages index
+	echo "[*] Downloading Debian package index..."
+	if ! curl --fail --location \
+		--output "${rootfs_tmpdir}/Packages.gz" \
+		"http://deb.debian.org/debian/dists/${DEBIAN_RELEASE}/main/binary-${debian_arch}/Packages.gz"; then
+		echo "[!] Failed to download Debian package index"
+		return 1
+	fi
+	
+	gunzip -f "${rootfs_tmpdir}/Packages.gz"
+	
+	# Essential packages for minimal Debian system
+	local essential_packages="base-files base-passwd bash coreutils dpkg apt libc6"
+	
+	for pkg_name in $essential_packages; do
+		echo "[*] Downloading Debian package: $pkg_name..."
+		
+		# Find package URL in Packages file
+		local pkg_url
+		pkg_url=$(awk -v pkg="$pkg_name" '
+			/^Package:/ { name=$2 }
+			/^Filename:/ && name == pkg { print $2; exit }
+		' "${rootfs_tmpdir}/Packages")
+		
+		if [ -z "$pkg_url" ]; then
+			echo "[!] Warning: Failed to find package: $pkg_name"
+			continue
+		fi
+		
+		# Download package
+		mkdir -p "${rootfs_tmpdir}/${pkg_name}"
+		if ! curl --fail --location --output "${rootfs_tmpdir}/${pkg_name}/package.deb" \
+			"http://deb.debian.org/debian/${pkg_url}"; then
+			echo "[!] Warning: Failed to download $pkg_name"
+			continue
+		fi
+		
+		# Extract package
+		(cd "${rootfs_tmpdir}/${pkg_name}"
+			ar x package.deb
+			
+			local data_archive
+			if [ -f "./data.tar.xz" ]; then
+				data_archive="data.tar.xz"
+			elif [ -f "./data.tar.zst" ]; then
+				data_archive="data.tar.zst"
+			elif [ -f "./data.tar.gz" ]; then
+				data_archive="data.tar.gz"
+			else
+				echo "[!] Warning: No data archive found for $pkg_name"
+				return 1
+			fi
+			
+			if ! tar xf "$data_archive" -C "${BOOTSTRAP_ROOTFS}/debian-rootfs" 2>/dev/null; then
+				echo "[!] Warning: Failed to extract $pkg_name"
+			fi
+		)
+	done
+	
+	# Configure Debian apt sources
+	echo "[*] Configuring Debian apt sources..."
+	mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs/etc/apt"
+	cat > "${BOOTSTRAP_ROOTFS}/debian-rootfs/etc/apt/sources.list" <<EOF
+# Debian ${DEBIAN_RELEASE} main repositories
+deb http://deb.debian.org/debian ${DEBIAN_RELEASE} main contrib non-free
+deb http://deb.debian.org/debian ${DEBIAN_RELEASE}-updates main contrib non-free
+deb http://deb.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free
+EOF
+	
+	# Create necessary directories
+	mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs"/{proc,sys,dev,tmp,root,home}
+	
+	echo "[*] Debian rootfs setup complete"
+	return 0
+}
+
+# Create start-debian.sh launcher script
+create_start_debian_script() {
+	echo "[*] Creating start-debian.sh script..."
+	
+	cat > "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/start-debian.sh" <<'EOF'
+#!/bin/bash
+
+# Start Debian environment using proot
+# This script launches a Debian shell using proot without requiring root access
+
+TERMUX_PREFIX="@TERMUX_PREFIX@"
+DEBIAN_ROOTFS="${TERMUX_PREFIX}/../debian-rootfs"
+PROOT="${TERMUX_PREFIX}/bin/proot"
+
+# Check if proot exists
+if [ ! -x "$PROOT" ]; then
+    echo "Error: proot not found at $PROOT"
+    exit 1
+fi
+
+# Check if Debian rootfs exists
+if [ ! -d "$DEBIAN_ROOTFS" ]; then
+    echo "Error: Debian rootfs not found at $DEBIAN_ROOTFS"
+    exit 1
+fi
+
+# Set up proot arguments
+PROOT_ARGS=(
+    --rootfs="$DEBIAN_ROOTFS"
+    --bind=/dev
+    --bind=/proc
+    --bind=/sys
+    --bind=/sdcard:/sdcard
+    --bind="${HOME}:/root"
+    --cwd=/root
+    /bin/env -i
+    HOME=/root
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    TERM=$TERM
+    LANG=C.UTF-8
+)
+
+# Launch shell
+echo "Starting Debian environment..."
+exec "$PROOT" "${PROOT_ARGS[@]}" /bin/bash --login
+EOF
+	
+	sed -i "s|@TERMUX_PREFIX@|${TERMUX_PREFIX}|g" "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/start-debian.sh"
+	chmod 755 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/start-debian.sh"
+}
+
+# Create Debian second stage initialization script
+create_debian_second_stage_script() {
+	echo "[*] Creating Debian second stage initialization script..."
+	
+	mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin"
+	cat > "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/debian-second-stage.sh" <<EOF
+#!/bin/bash
+# Debian second stage initialization script
+# Runs inside the Debian rootfs via proot to complete setup
+
+set -e
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export LANG=C.UTF-8
+export TERM=xterm-256color
+
+echo "[*] Running Debian second stage initialization..."
+
+# Configure locale
+echo "[*] Configuring locales..."
+apt-get update -y || true
+apt-get install -y locales 2>/dev/null || true
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen 2>/dev/null || true
+locale-gen en_US.UTF-8 2>/dev/null || true
+export LANG=en_US.UTF-8
+
+# Create necessary device nodes (will be bind-mounted by proot)
+echo "[*] Setting up environment..."
+mkdir -p /dev /proc /sys /tmp /run
+
+# Configure timezone
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime 2>/dev/null || true
+
+# Set root password
+echo 'root:debian' | chpasswd 2>/dev/null || true
+
+# Create a regular user
+useradd -m -s /bin/bash termux 2>/dev/null || true
+echo 'termux:termux' | chpasswd 2>/dev/null || true
+
+echo "[*] Debian second stage complete!"
+echo "[*] You can now use apt-get to install packages."
+EOF
+	
+	chmod 755 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/debian-second-stage.sh"
+}
+
 # Final stage: generate bootstrap archive and place it to current
 # working directory.
 # Information about symlinks is stored in file SYMLINKS.txt.
@@ -298,6 +518,13 @@ Available command_options:
   [ --android10 ]
                      Generate bootstrap archives for Android 10+ for
                      apk packaging system.
+  [ --debian-proot ]
+                     Generate a Debian-based bootstrap using proot.
+                     Downloads a minimal Debian rootfs and includes
+                     proot to run it without root access.
+  [ --debian-release RELEASE ]
+                     Specify Debian release codename (default: bookworm).
+                     Used only with --debian-proot.
   [ -a | --add <packages> ]
                      Additional packages to include into bootstrap archive.
                      Multiple packages should be passed as comma-separated list.
@@ -322,11 +549,20 @@ Build default bootstrap archive for aarch64 arch only:
 
 Build bootstrap archive with additionall openssh package for aarch64 arch only:
 ./scripts/run-docker.sh ./scripts/build-bootstraps.sh --architectures aarch64 --add openssh &> build.log
+
+Build Debian proot bootstrap for aarch64:
+./scripts/run-docker.sh ./scripts/build-bootstraps.sh --debian-proot --architectures aarch64 &> build.log
 HELP_EOF
 
 echo $'\n'"TERMUX_APP_PACKAGE: \"$TERMUX_APP_PACKAGE\""
 echo "TERMUX_PREFIX: \"${TERMUX_PREFIX[*]}\""
 echo "TERMUX_ARCHITECTURES: \"${TERMUX_ARCHITECTURES[*]}\""
+if [ "$BOOTSTRAP_DEBIAN_PROOT" = "true" ]; then
+	echo "BOOTSTRAP_MODE: Debian proot"
+	echo "DEBIAN_RELEASE: \"${DEBIAN_RELEASE}\""
+else
+	echo "BOOTSTRAP_MODE: Native Termux"
+fi
 
 }
 

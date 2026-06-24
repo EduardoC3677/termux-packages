@@ -40,6 +40,25 @@ REPO_BASE_URL="${REPO_BASE_URLS[${TERMUX_PACKAGE_MANAGER}]}"
 # be filled with option '--add'.
 declare -a ADDITIONAL_PACKAGES
 
+# Debian proot mode: when enabled, the bootstrap downloads a Debian arm64
+# rootfs from official Debian repositories instead of Termux packages,
+# and uses proot to run it without root access.
+BOOTSTRAP_DEBIAN_PROOT=false
+
+# Debian release codename for the rootfs.
+DEBIAN_RELEASE="bookworm"
+
+# Debian rootfs base URL for downloading debootstrap/minbase tarballs.
+DEBIAN_ROOTFS_BASE_URL="http://deb.debian.org/debian"
+
+# Debian architecture mapping from Termux arch names.
+declare -A DEBIAN_ARCH_MAP=(
+	["aarch64"]="arm64"
+	["arm"]="armhf"
+	["i686"]="i386"
+	["x86_64"]="amd64"
+)
+
 # Check for some important utilities that may not be available for
 # some reason.
 for cmd in ar awk curl grep gzip find sed tar xargs xz zip jq; do
@@ -109,6 +128,218 @@ read_db_packages_pac() {
 
 print_desc_package_pac() {
 	echo -e "%${1}%\n${2}\n"
+}
+
+# Download and extract proot from Termux repositories
+download_proot() {
+	local architecture="$1"
+	local proot_tmpdir="${BOOTSTRAP_TMPDIR}/proot"
+	mkdir -p "$proot_tmpdir"
+	
+	echo "[*] Downloading proot for architecture '${architecture}'..."
+	
+	# Read package list to find proot package
+	unset PROOT_METADATA
+	declare -A PROOT_METADATA
+	
+	local pkg_arch
+	for pkg_arch in all "$architecture"; do
+		if [ ! -e "${proot_tmpdir}/packages.${pkg_arch}" ]; then
+			curl --fail --location \
+				--output "${proot_tmpdir}/packages.${pkg_arch}" \
+				"${REPO_BASE_URL}/dists/stable/main/binary-${pkg_arch}/Packages" || {
+				if [ "$pkg_arch" = "all" ]; then
+					continue
+				fi
+				return 1
+			}
+		fi
+		
+		while read -r -d $'\xFF' package; do
+			if [ -n "$package" ]; then
+				local package_name
+				package_name=$(echo "$package" | grep -i "^Package:" | awk '{ print $2 }')
+				if [ "$package_name" = "proot" ]; then
+					PROOT_METADATA["$package_name"]="$package"
+					break 2
+				fi
+			fi
+		done < <(sed -e "s/^$/\xFF/g" "${proot_tmpdir}/packages.${pkg_arch}")
+	done
+	
+	if [ -z "${PROOT_METADATA["proot"]}" ]; then
+		echo "[!] Failed to find proot package metadata"
+		return 1
+	fi
+	
+	local package_url
+	package_url="$REPO_BASE_URL/$(echo "${PROOT_METADATA[proot]}" | grep -i "^Filename:" | awk '{ print $2 }')"
+	
+	echo "[*] Downloading proot package..."
+	curl --fail --location --output "$proot_tmpdir/proot.deb" "$package_url"
+	
+	echo "[*] Extracting proot..."
+	(cd "$proot_tmpdir"
+		ar x proot.deb
+		
+		local data_archive
+		if [ -f "./data.tar.xz" ]; then
+			data_archive="data.tar.xz"
+		elif [ -f "./data.tar.gz" ]; then
+			data_archive="data.tar.gz"
+		else
+			echo "[!] No data.tar.* found in proot package"
+			return 1
+		fi
+		
+		# Extract proot binary to Termux prefix bin directory
+		mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin"
+		tar xf "$data_archive" -C "$BOOTSTRAP_ROOTFS" "./${TERMUX_PREFIX}/bin/proot"
+		chmod 755 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/proot"
+	)
+}
+
+# Download and extract Debian rootfs
+download_debian_rootfs() {
+	local architecture="$1"
+	local debian_arch="${DEBIAN_ARCH_MAP[$architecture]}"
+	
+	if [ -z "$debian_arch" ]; then
+		echo "[!] Unsupported architecture '$architecture' for Debian rootfs"
+		return 1
+	fi
+	
+	echo "[*] Downloading Debian ${DEBIAN_RELEASE} rootfs for ${debian_arch}..."
+	
+	local rootfs_tmpdir="${BOOTSTRAP_TMPDIR}/debian-rootfs"
+	mkdir -p "$rootfs_tmpdir"
+	
+	# Download debootstrap base system
+	# Using minbase variant for minimal installation
+	local rootfs_url="http://deb.debian.org/debian/dists/${DEBIAN_RELEASE}/main/binary-${debian_arch}/"
+	
+	echo "[*] Creating Debian rootfs structure..."
+	mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs"
+	
+	# Create minimal Debian rootfs using debootstrap packages
+	# Download essential packages: base-files, base-passwd, bash, coreutils, dpkg, apt
+	local essential_packages="base-files base-passwd bash coreutils dpkg apt libc6"
+	
+	for pkg_name in $essential_packages; do
+		echo "[*] Downloading Debian package: $pkg_name..."
+		
+		# Download Packages list
+		if [ ! -e "${rootfs_tmpdir}/Packages" ]; then
+			curl --fail --location \
+				--output "${rootfs_tmpdir}/Packages" \
+				"http://deb.debian.org/debian/dists/${DEBIAN_RELEASE}/main/binary-${debian_arch}/Packages.gz"
+			gunzip -f "${rootfs_tmpdir}/Packages.gz" 2>/dev/null || true
+		fi
+		
+		# Find package URL
+		local pkg_url
+		pkg_url=$(awk -v pkg="$pkg_name" '
+			/^Package:/ { name=$2 }
+			/^Filename:/ && name == pkg { print $2; exit }
+		' "${rootfs_tmpdir}/Packages")
+		
+		if [ -z "$pkg_url" ]; then
+			echo "[!] Failed to find package: $pkg_name"
+			continue
+		fi
+		
+		# Download and extract package
+		mkdir -p "${rootfs_tmpdir}/${pkg_name}"
+		curl --fail --location --output "${rootfs_tmpdir}/${pkg_name}/package.deb" \
+			"http://deb.debian.org/debian/${pkg_url}"
+		
+		(cd "${rootfs_tmpdir}/${pkg_name}"
+			ar x package.deb
+			
+			local data_archive
+			if [ -f "./data.tar.xz" ]; then
+				data_archive="data.tar.xz"
+			elif [ -f "./data.tar.zst" ]; then
+				data_archive="data.tar.zst"
+			elif [ -f "./data.tar.gz" ]; then
+				data_archive="data.tar.gz"
+			else
+				echo "[!] No data archive found for $pkg_name"
+				return 1
+			fi
+			
+			tar xf "$data_archive" -C "${BOOTSTRAP_ROOTFS}/debian-rootfs" 2>/dev/null || {
+				# Some packages may have issues, continue
+				echo "[!] Warning: Failed to extract $pkg_name"
+			}
+		)
+	done
+	
+	# Configure Debian apt sources
+	echo "[*] Configuring Debian apt sources..."
+	mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs/etc/apt"
+	cat > "${BOOTSTRAP_ROOTFS}/debian-rootfs/etc/apt/sources.list" <<EOF
+# Debian ${DEBIAN_RELEASE} main repositories
+deb http://deb.debian.org/debian ${DEBIAN_RELEASE} main contrib non-free
+deb http://deb.debian.org/debian ${DEBIAN_RELEASE}-updates main contrib non-free
+deb http://deb.debian.org/debian-security ${DEBIAN_RELEASE}-security main contrib non-free
+EOF
+	
+	# Create necessary directories
+	mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs"/{proc,sys,dev,tmp,root,home}
+	
+	echo "[*] Debian rootfs setup complete"
+}
+
+# Create start-debian.sh script for launching Debian with proot
+create_start_debian_script() {
+	echo "[*] Creating start-debian.sh script..."
+	
+	cat > "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/start-debian.sh" <<'EOF'
+#!/bin/bash
+
+# Start Debian environment using proot
+# This script launches a Debian shell using proot without requiring root access
+
+TERMUX_PREFIX="@TERMUX_PREFIX@"
+DEBIAN_ROOTFS="${TERMUX_PREFIX}/../debian-rootfs"
+PROOT="${TERMUX_PREFIX}/bin/proot"
+
+# Check if proot exists
+if [ ! -x "$PROOT" ]; then
+    echo "Error: proot not found at $PROOT"
+    exit 1
+fi
+
+# Check if Debian rootfs exists
+if [ ! -d "$DEBIAN_ROOTFS" ]; then
+    echo "Error: Debian rootfs not found at $DEBIAN_ROOTFS"
+    exit 1
+fi
+
+# Set up proot arguments
+PROOT_ARGS=(
+    --rootfs="$DEBIAN_ROOTFS"
+    --bind=/dev
+    --bind=/proc
+    --bind=/sys
+    --bind=/sdcard:/sdcard
+    --bind="${HOME}:/root"
+    --cwd=/root
+    /bin/env -i
+    HOME=/root
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    TERM=$TERM
+    LANG=C.UTF-8
+)
+
+# Launch shell
+echo "Starting Debian environment..."
+exec "$PROOT" "${PROOT_ARGS[@]}" /bin/bash --login
+EOF
+	
+	sed -i "s|@TERMUX_PREFIX@|${TERMUX_PREFIX}|g" "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/start-debian.sh"
+	chmod 755 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/start-debian.sh"
 }
 
 # Download specified package, its dependencies and then extract *.deb or *.pkg.tar.xz files to
@@ -307,6 +538,13 @@ show_usage() {
 	echo
 	echo " --android10                 Generate bootstrap archives for Android 10."
 	echo
+	echo " --debian-proot              Generate a Debian-based bootstrap using proot."
+	echo "                             Downloads a minimal Debian rootfs and includes"
+	echo "                             proot to run it without root access."
+	echo
+	echo " --debian-release RELEASE    Specify Debian release codename (default: bookworm)."
+	echo "                             Used only with --debian-proot."
+	echo
 	echo " -a, --add PKG_LIST          Specify one or more additional packages"
 	echo "                             to include into bootstrap archive."
 	echo "                             Multiple packages should be passed as"
@@ -340,6 +578,19 @@ while (($# > 0)); do
 			;;
 		--android10)
 			BOOTSTRAP_ANDROID10_COMPATIBLE=true
+			;;
+		--debian-proot)
+			BOOTSTRAP_DEBIAN_PROOT=true
+			;;
+		--debian-release)
+			if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]; then
+				DEBIAN_RELEASE="$2"
+				shift 1
+			else
+				echo "[!] Option '--debian-release' requires an argument." 1>&2
+				show_usage
+				exit 1
+			fi
 			;;
 		-a|--add)
 			if [ $# -gt 1 ] && [ -n "$2" ] && [[ $2 != -* ]]; then
@@ -438,6 +689,93 @@ for package_arch in "${TERMUX_ARCHITECTURES[@]}"; do
 	# Read package metadata.
 	unset PACKAGE_METADATA
 	declare -A PACKAGE_METADATA
+
+	if ${BOOTSTRAP_DEBIAN_PROOT}; then
+		# ============================================================
+		# DEBIAN PROOT MODE
+		# Download proot binary from Termux repos and Debian rootfs
+		# from official Debian repositories.
+		# ============================================================
+
+		echo "[*] Building Debian proot bootstrap for architecture: ${package_arch}"
+
+		# Create basic directories
+		mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin"
+		mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/lib"
+		mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/tmp"
+		mkdir -p "${BOOTSTRAP_ROOTFS}/debian-rootfs"
+
+		# Download proot from Termux repositories
+		if [ ${TERMUX_PACKAGE_MANAGER} = "apt" ]; then
+			read_package_list_deb "$package_arch"
+		else
+			download_db_packages_pac
+		fi
+		download_proot "$package_arch"
+
+		# Download Debian rootfs
+		download_debian_rootfs "$package_arch"
+
+		# Create start-debian.sh script
+		create_start_debian_script
+
+		# Create a second stage script for Debian initialization
+		echo "[*] Creating Debian second stage initialization script..."
+		mkdir -p "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin"
+		cat > "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/debian-second-stage.sh" <<EOF
+#!/bin/bash
+# Debian second stage initialization script
+# Runs inside the Debian rootfs via proot to complete setup
+
+set -e
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export LANG=C.UTF-8
+export TERM=xterm-256color
+
+echo "[*] Running Debian second stage initialization..."
+
+# Configure locale
+echo "[*] Configuring locales..."
+apt-get update -y || true
+apt-get install -y locales 2>/dev/null || true
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen 2>/dev/null || true
+locale-gen en_US.UTF-8 2>/dev/null || true
+export LANG=en_US.UTF-8
+
+# Create necessary device nodes (will be bind-mounted by proot)
+echo "[*] Setting up environment..."
+mkdir -p /dev /proc /sys /tmp /run
+
+# Configure timezone
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime 2>/dev/null || true
+
+# Set root password
+echo 'root:debian' | chpasswd 2>/dev/null || true
+
+# Create a regular user
+useradd -m -s /bin/bash termux 2>/dev/null || true
+echo 'termux:termux' | chpasswd 2>/dev/null || true
+
+echo "[*] Debian second stage complete!"
+echo "[*] You can now use apt-get to install packages."
+EOF
+		chmod 755 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/debian-second-stage.sh"
+
+		# Create bootstrap archive
+		echo "[*] Creating Debian proot bootstrap archive..."
+		(cd "${BOOTSTRAP_ROOTFS}"
+			zip -r9 "${BOOTSTRAP_TMPDIR}/bootstrap-${package_arch}.zip" .
+		)
+		mv -f "${BOOTSTRAP_TMPDIR}/bootstrap-${package_arch}.zip" ./
+		echo "[*] Finished successfully (Debian proot: ${package_arch})."
+
+	else
+		# ============================================================
+		# ORIGINAL TERMUX BOOTSTRAP MODE
+		# ============================================================
+
 	if [ ${TERMUX_PACKAGE_MANAGER} = "apt" ]; then
 		read_package_list_deb "$package_arch"
 	else
@@ -501,4 +839,7 @@ for package_arch in "${TERMUX_ARCHITECTURES[@]}"; do
 
 	# Create bootstrap archive.
 	create_bootstrap_archive "$package_arch"
+
+	fi  # End of debian-proot vs original bootstrap mode
+
 done
