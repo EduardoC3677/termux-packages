@@ -504,6 +504,50 @@ add_termux_bootstrap_second_stage_files() {
 		> "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/01-termux-bootstrap-second-stage-fallback.sh"
 	chmod 600 "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/01-termux-bootstrap-second-stage-fallback.sh"
 
+	# Install su/sudo/tsu wrappers for Debian proot compatibility
+	local wrapper_scripts=(
+		"termux-su-wrapper.sh:su"
+		"termux-sudo-wrapper.sh:sudo"
+		"termux-tsu-wrapper.sh:tsu-android"
+	)
+	for wrapper_entry in "${wrapper_scripts[@]}"; do
+		local wrapper_script="${wrapper_entry%%:*}"
+		local target_name="${wrapper_entry##*:}"
+		local wrapper_script_path="$TERMUX_SCRIPTDIR/scripts/$wrapper_script"
+		if [ -f "$wrapper_script_path" ]; then
+			cp "$wrapper_script_path" "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/$target_name"
+			chmod 700 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/$target_name"
+		fi
+	done
+
+	# Create environment detection script for profile.d
+	cat > "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/02-termux-env-detection.sh" <<'ENVEOF'
+#!/data/data/com.termux/files/usr/bin/bash
+# Detect and configure environment (Debian proot vs Android native)
+
+# Check if running in proot
+if [ -n "$PROOT_VERSION" ] || [ -n "$PROOT_DISTRIBUTION" ] || [ -f "/etc/debian_version" ]; then
+    export TERMUX_ENV_TYPE="debian-proot"
+    export TERMUX_DEBIAN_ROOT="/debian-rootfs"
+    
+    # Prepend Debian paths if they exist
+    if [ -d "/debian-rootfs/usr/bin" ]; then
+        export PATH="/debian-rootfs/usr/bin:/debian-rootfs/bin:$PATH"
+    fi
+    
+    # Use Debian's su/sudo
+    if [ -x "/debian-rootfs/usr/bin/su" ]; then
+        alias su='/debian-rootfs/usr/bin/su'
+    fi
+    if [ -x "/debian-rootfs/usr/bin/sudo" ]; then
+        alias sudo='/debian-rootfs/usr/bin/sudo'
+    fi
+else
+    export TERMUX_ENV_TYPE="android-native"
+fi
+ENVEOF
+	chmod 600 "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/02-termux-env-detection.sh"
+
 }
 
 # Final stage: generate bootstrap archive and place it to current

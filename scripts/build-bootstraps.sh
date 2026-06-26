@@ -240,6 +240,22 @@ add_termux_bootstrap_second_stage_files() {
 		> "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/01-termux-bootstrap-second-stage-fallback.sh"
 	chmod 600 "${BOOTSTRAP_ROOTFS}/${TERMUX__PREFIX__PROFILE_D_DIR}/01-termux-bootstrap-second-stage-fallback.sh"
 
+	# Install su/sudo/tsu wrappers for Debian proot compatibility
+	local wrapper_scripts=(
+		"termux-su-wrapper.sh:su"
+		"termux-sudo-wrapper.sh:sudo"
+		"termux-tsu-wrapper.sh:tsu-android"
+	)
+	for wrapper_entry in "${wrapper_scripts[@]}"; do
+		local wrapper_script="${wrapper_entry%%:*}"
+		local target_name="${wrapper_entry##*:}"
+		local wrapper_script_path="$TERMUX_SCRIPTDIR/scripts/$wrapper_script"
+		if [ -f "$wrapper_script_path" ]; then
+			cp "$wrapper_script_path" "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/$target_name"
+			chmod 700 "${BOOTSTRAP_ROOTFS}/${TERMUX_PREFIX}/bin/$target_name"
+		fi
+	done
+
 }
 
 # Build proot package from Termux source

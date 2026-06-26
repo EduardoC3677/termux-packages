@@ -23,6 +23,9 @@ termux_step_make_install() {
 	# There is no install.sh script in the repository for now
 	mkdir -p "$TERMUX_PREFIX/bin"
 	install -Dm755 tsu "$TERMUX_PREFIX/bin"
-	# sudo - is an included addon in tsu now
-	ln -sf "$TERMUX_PREFIX/bin/tsu" "$TERMUX_PREFIX/bin/sudo"
+	
+	# Install wrappers for Debian proot compatibility
+	install -Dm755 "$TERMUX_PKG_BUILDER_DIR/termux-su-wrapper.sh" "$TERMUX_PREFIX/bin/su"
+	install -Dm755 "$TERMUX_PKG_BUILDER_DIR/termux-sudo-wrapper.sh" "$TERMUX_PREFIX/bin/sudo"
+	install -Dm755 "$TERMUX_PKG_BUILDER_DIR/termux-tsu-wrapper.sh" "$TERMUX_PREFIX/bin/tsu-android"
 }
