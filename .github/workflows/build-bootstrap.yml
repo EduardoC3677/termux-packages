@@ -1,0 +1,165 @@
+name: Build Bootstrap
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'packages/**'
+      - 'scripts/generate-bootstraps.sh'
+      - 'scripts/build-bootstraps.sh'
+      - 'scripts/bootstrap/**'
+      - 'scripts/properties.sh'
+      - '.github/workflows/build-bootstrap.yml'
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: 'Architectures to build (comma-separated: aarch64,arm,i686,x86_64)'
+        required: false
+        default: 'aarch64,arm,i686,x86_64'
+      android10:
+        description: 'Build Android 10+ compatible bootstrap'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-bootstrap:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(format('["{0}"]', replace(github.event.inputs.architectures || 'aarch64,arm,i686,x86_64', ',', '","'))) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup environment
+        run: |
+          echo "Setting up build environment..."
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget xz-utils zip unzip jq
+      
+      - name: Build bootstrap for ${{ matrix.arch }}
+        run: |
+          echo "Building bootstrap for architecture: ${{ matrix.arch }}"
+          
+          # Use generate-bootstraps.sh for standard builds
+          # Use build-bootstraps.sh for local package builds
+          ./scripts/generate-bootstraps.sh --architectures ${{ matrix.arch }}
+      
+      - name: Verify bootstrap archives
+        run: |
+          echo "Verifying generated bootstrap archives..."
+          
+          if [ ! -f bootstrap-${{ matrix.arch }}.zip ]; then
+            echo "ERROR: bootstrap-${{ matrix.arch }}.zip not found"
+            ls -la *.zip || echo "No zip files found"
+            exit 1
+          fi
+          
+          echo "Bootstrap archive size:"
+          ls -lh bootstrap-${{ matrix.arch }}.zip
+          
+          echo "Bootstrap archive contents (first 20 items):"
+          unzip -l bootstrap-${{ matrix.arch }}.zip | head -20
+          
+          echo "Verifying SYMLINKS.txt exists..."
+          unzip -l bootstrap-${{ matrix.arch }}.zip | grep -q SYMLINKS.txt || {
+            echo "WARNING: SYMLINKS.txt not found in bootstrap archive"
+          }
+      
+      - name: Upload bootstrap artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.arch }}
+          path: bootstrap-${{ matrix.arch }}.zip
+          retention-days: 30
+      
+      - name: Calculate SHA256 checksums
+        run: |
+          sha256sum bootstrap-${{ matrix.arch }}.zip > bootstrap-${{ matrix.arch }}.sha256
+          cat bootstrap-${{ matrix.arch }}.sha256
+      
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.arch }}-checksum
+          path: bootstrap-${{ matrix.arch }}.sha256
+          retention-days: 30
+  
+  create-release:
+    needs: build-bootstrap
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Download all bootstrap artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+      
+      - name: Prepare release files
+        run: |
+          echo "Preparing release files..."
+          mkdir -p release
+          find ./artifacts -name "*.zip" -exec cp {} ./release/ \;
+          find ./artifacts -name "*.sha256" -exec cp {} ./release/ \;
+          ls -lh ./release/
+      
+      - name: Generate release tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+          else
+            TAG_NAME="bootstrap-$(date +%Y%m%d-%H%M%S)"
+          fi
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "Release tag: $TAG_NAME"
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: Bootstrap Build ${{ steps.tag.outputs.tag_name }}
+          body: |
+            ## Bootstrap Archives
+            
+            This release contains bootstrap archives for Termux.
+            
+            ### Included Architectures
+            - aarch64 (ARM 64-bit)
+            - arm (ARM 32-bit)
+            - i686 (x86 32-bit)
+            - x86_64 (x86 64-bit)
+            
+            ### Build Information
+            - Commit: ${{ github.sha }}
+            - Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            - Triggered by: ${{ github.event_name }}
+            
+            ### Files
+            - `bootstrap-*.zip` - Bootstrap archives
+            - `bootstrap-*.sha256` - SHA256 checksums
+          files: |
+            ./release/*.zip
+            ./release/*.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
